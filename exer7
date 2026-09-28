@@ -1,0 +1,83 @@
+"""Exercício 7 — XSS onde ninguém procura: dentro do atributo (A05).
+
+LABORATÓRIO: os payloads rodam apenas contra esta aplicação local.
+Dependências: pip install flask pymongo
+Uso: python ex7_dashboard.py  ->  http://127.0.0.1:5000/dashboard  e  /dashboard-inseguro
+"""
+import os
+
+from flask import Flask, render_template_string
+from pymongo import MongoClient
+
+app = Flask(__name__)
+
+mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+incidentes = mongo[os.getenv("MONGO_DB", "seguranca")]["incidentes_xss"]
+
+p1 = "<script>alert('xss1')</script>"
+p2 = 'x" onerror="alert(\'xss2\')'  # escapa do atributo, sem usar <script>
+
+
+def preparar_banco():
+    incidentes.delete_many({})
+    incidentes.insert_many([
+        {"titulo": p1, "ativo": "SRV-WEB01"},          # payload 1: na célula da tabela
+        {"titulo": "Phishing no RH", "ativo": p2},     # payload 2: dentro do atributo alt
+    ])
+
+
+# ---------- 2. CSP em TODAS as respostas ----------
+@app.after_request
+def cabecalhos_de_seguranca(resp):
+    resp.headers["Content-Security-Policy"] = "default-src 'self'"
+    return resp
+
+
+# ---------- 1. Rota segura: Jinja2 com escape automático ----------
+# Sem inline <style>/<script>: a CSP default-src 'self' bloqueia os dois.
+# O alt fica entre aspas duplas e o Jinja converte " em &#34; e ' em &#39;, então o valor não sai do atributo.
+# Um |safe mal colocado diz ao Jinja "já está escapado": o payload chega cru ao HTML e volta a executar.
+TEMPLATE_SEGURO = """<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>Dashboard</title></head>
+<body>
+<h1>Dashboard de incidentes</h1>
+<table border="1" cellpadding="6">
+  <tr><th>Ícone</th><th>Incidente</th><th>Ativo</th></tr>
+  {% for i in incidentes %}
+  <tr>
+    <td><img src="/icone.png" alt="{{ i.ativo }}"></td>
+    <td>{{ i.titulo }}</td>
+    <td>{{ i.ativo }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</body>
+</html>"""
+
+
+@app.route("/dashboard")
+def dashboard():
+    return render_template_string(TEMPLATE_SEGURO, incidentes=list(incidentes.find()))
+
+
+# ---------- 3. Rota INSEGURA (só para comparação) ----------
+@app.route("/dashboard-inseguro")
+def dashboard_inseguro():
+    linhas = "".join(
+        f'<tr><td><img src="/icone.png" alt="{i["ativo"]}"></td>'
+        f'<td>{i["titulo"]}</td><td>{i["ativo"]}</td></tr>'
+        for i in incidentes.find()
+    )
+    return (
+        "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><title>INSEGURO</title></head><body>"
+        "<h1>⚠ ROTA INSEGURA — APENAS PARA COMPARAÇÃO EM LABORATÓRIO ⚠</h1>"
+        "<p>Aqui o HTML é montado por concatenação, sem escape.</p>"
+        f'<table border="1" cellpadding="6"><tr><th>Ícone</th><th>Incidente</th><th>Ativo</th></tr>{linhas}</table>'
+        "</body></html>"
+    )
+
+
+if __name__ == "__main__":
+    preparar_banco()
+    app.run(debug=False, host="127.0.0.1")

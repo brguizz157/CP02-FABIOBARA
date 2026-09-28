@@ -1,0 +1,62 @@
+"""Exercício 3 — Retenção e janela temporal (MongoDB: índice TTL + agregação por hora).
+
+Dependência: pip install pymongo
+"""
+import os
+import random
+from datetime import datetime, timedelta, timezone
+
+from pymongo import MongoClient
+
+FUSO = os.getenv("SOC_TZ", "America/Sao_Paulo")  # fuso usado para "hora do dia"
+TTL_SEGUNDOS = 604800  # 7 dias
+
+mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+eventos = mongo[os.getenv("MONGO_DB", "seguranca")]["eventos"]
+
+# ---------- Coleção limpa + índice TTL ----------
+eventos.drop()  # permite rodar o script mais de uma vez
+eventos.create_index("timestamp", expireAfterSeconds=TTL_SEGUNDOS)
+
+# ---------- 200 eventos espalhados nas últimas 24h ----------
+agora = datetime.now(timezone.utc)
+pico = random.uniform(0, 24 * 3600)  # um horário com mais falhas, para o gráfico ter forma
+docs = []
+for _ in range(200):
+    segundos_atras = random.triangular(0, 24 * 3600, pico) if random.random() < 0.6 else random.uniform(0, 24 * 3600)
+    docs.append({
+        "timestamp": agora - timedelta(seconds=segundos_atras),
+        "tipo": "LOGIN",
+        "resultado": random.choices(["falha", "sucesso"], weights=[70, 30])[0],
+        "ip_origem": f"192.168.1.{random.randint(2, 254)}",
+    })
+eventos.insert_many(docs)
+
+# ---------- Agregação: falhas por hora do dia (janela de 24h) ----------
+pipeline = [
+    {"$match": {"resultado": "falha", "timestamp": {"$gte": agora - timedelta(hours=24)}}},
+    {"$group": {"_id": {"$hour": {"date": "$timestamp", "timezone": FUSO}}, "total": {"$sum": 1}}},
+    {"$sort": {"_id": 1}},
+]
+por_hora = list(eventos.aggregate(pipeline))
+
+# ---------- Saída ----------
+maior = max(h["total"] for h in por_hora)
+hora_pico = max(por_hora, key=lambda h: h["total"])
+
+print("=== Falhas por hora (últimas 24h) ===")
+for h in por_hora:
+    barra = "█" * max(1, round(h["total"] / maior * 20))
+    marca = "   <- pico" if h is hora_pico else ""
+    print(f"{h['_id']:02d}h | {barra} {h['total']}{marca}")
+
+print(f"Hora de pico: {hora_pico['_id']:02d}h ({hora_pico['total']} falhas)")
+
+ttl = eventos.index_information()["timestamp_1"].get("expireAfterSeconds")
+if ttl == TTL_SEGUNDOS:
+    print("Índice TTL ativo: eventos com mais de 7 dias serão removidos automaticamente.")
+
+# Comentário: o TTL é decisão de segurança porque guardar log para sempre amplia o que um
+# vazamento expõe (IPs, usuários) e vira passivo legal, enquanto o prazo define até onde a investigação alcança.
+
+mongo.close()

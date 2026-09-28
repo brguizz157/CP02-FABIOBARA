@@ -1,0 +1,185 @@
+"""Exercício 9 — Rate limiting guiado por anomalia (IsolationForest + MongoDB).
+
+Dependências: pip install flask pymongo scikit-learn numpy
+Uso:
+    python ex9_rate_limit.py          # sobe a API (a análise roda em segundo plano a cada 30 s)
+    python ex9_rate_limit.py teste    # roda o roteiro de teste (não precisa do servidor no ar)
+"""
+import os
+import sys
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+from flask import Flask, g, jsonify, request
+from pymongo import MongoClient
+from sklearn.ensemble import IsolationForest
+
+app = Flask(__name__)
+
+mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+acessos = mongo[os.getenv("MONGO_DB", "seguranca")]["acessos"]
+
+JANELA_MIN = 15          # só olha os acessos dos últimos 15 minutos
+MIN_OBSERVACAO_S = 10    # piso na duração observada, para não dividir por ~0
+BLOQUEIO_S = 60          # duração do bloqueio e valor de Retry-After
+MIN_IPS = 5              # abaixo disso não há população para definir o que é "normal"
+
+bloqueados = {}  # ip -> instante em que o bloqueio expira
+
+
+def relogio():
+    """UTC sem fuso (é assim que o MongoDB devolve datas). Existe para o teste poder simular o tempo."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ---------- 1 e 2. Registro de cada requisição ----------
+@app.before_request
+def registrar_e_barrar():
+    # remote_addr, nunca X-Forwarded-For: esse header o próprio cliente pode forjar.
+    ip = request.remote_addr
+    g.acesso_id = acessos.insert_one(
+        {"ip": ip, "rota": request.path, "metodo": request.method, "timestamp": relogio()}
+    ).inserted_id
+
+    # ---------- 5. IP anômalo recebe 429 ----------
+    expira = bloqueados.get(ip)
+    if expira is not None:
+        if relogio() < expira:
+            resp = jsonify({"erro": "muitas requisições"})
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(BLOQUEIO_S)
+            return resp
+        bloqueados.pop(ip, None)  # bloqueio expirou
+
+
+@app.after_request
+def completar_registro(resp):
+    acesso_id = g.get("acesso_id")
+    if acesso_id is not None:
+        acessos.update_one({"_id": acesso_id}, {"$set": {"status": resp.status_code}})
+    return resp
+
+
+@app.route("/")
+def raiz():
+    return jsonify({"ok": True})
+
+
+@app.route("/api/status")
+def status():
+    return jsonify({"status": "ok"})
+
+
+# ---------- 3 e 4. Agregação por IP + IsolationForest ----------
+def analisar_acessos(imprimir=False):
+    inicio = relogio() - timedelta(minutes=JANELA_MIN)
+    grupos = list(acessos.aggregate([
+        {"$match": {"timestamp": {"$gte": inicio}}},
+        {"$group": {
+            "_id": "$ip",
+            "n": {"$sum": 1},
+            "primeiro": {"$min": "$timestamp"},
+            "ultimo": {"$max": "$timestamp"},
+            "n4xx": {"$sum": {"$cond": [{"$and": [{"$gte": ["$status", 400]}, {"$lt": ["$status", 500]}]}, 1, 0]}},
+            "rotas": {"$addToSet": "$rota"},
+        }},
+    ]))
+    if len(grupos) < MIN_IPS:
+        return []
+
+    linhas = []
+    for gr in grupos:
+        duracao_s = max((gr["ultimo"] - gr["primeiro"]).total_seconds(), MIN_OBSERVACAO_S)
+        linhas.append({
+            "ip": gr["_id"],
+            "req_min": gr["n"] / (duracao_s / 60),
+            "taxa_4xx": gr["n4xx"] / gr["n"],
+            "rotas": len(gr["rotas"]),
+        })
+
+    X = np.array([[l["req_min"], l["taxa_4xx"], l["rotas"]] for l in linhas])
+    rotulos = IsolationForest(contamination=0.2, random_state=42).fit_predict(X)  # -1 = anômalo
+
+    anomalos = []
+    if imprimir:
+        print("=== Análise de acessos ===")
+    for l, rotulo in sorted(zip(linhas, rotulos), key=lambda p: p[0]["req_min"]):
+        anomalo = rotulo == -1
+        if anomalo:
+            bloqueados[l["ip"]] = relogio() + timedelta(seconds=BLOQUEIO_S)
+            anomalos.append(l["ip"])
+        if imprimir:
+            veredito = "ANOMALIA -> bloqueado" if anomalo else "normal"
+            print(f"{l['ip']:<15} [{l['req_min']:5.1f} req/min | 4xx {l['taxa_4xx']:.2f} | {l['rotas']} rotas]  -> {veredito}")
+    return anomalos
+
+
+# Comentário:
+# Bloquear por anomalia pode derrubar quem é legítimo: com contamination=0.2, 20% dos IPs são marcados mesmo sem ataque,
+# e um pico legítimo (ou vários usuários atrás do mesmo NAT) parece anômalo; a regra fixa é previsível e explicável.
+
+
+# ---------- Roteiro de teste ----------
+def rodar_testes():
+    acessos.delete_many({})
+    bloqueados.clear()
+    global relogio
+    relogio_real = relogio
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    agora = [t0]
+    relogio = lambda: agora[0]
+    cliente = app.test_client()
+
+    def requisitar(ip, rota, quando):
+        agora[0] = quando
+        return cliente.get(rota, environ_overrides={"REMOTE_ADDR": ip})
+
+    try:
+        # IP normal: 5 requisições válidas espaçadas (2,5 min entre elas), todas 200.
+        rotas_normais = ["/", "/api/status", "/", "/api/status", "/"]
+        codigos = [requisitar("192.168.1.10", r, t0 + timedelta(minutes=2.5 * i)).status_code
+                   for i, r in enumerate(rotas_normais)]
+        print("IP normal (5 requisições espaçadas) ->", codigos)
+
+        # Outros IPs comuns: dão à IsolationForest uma população de referência.
+        for ip in ("192.168.1.20", "192.168.1.30", "192.168.1.40"):
+            for i in range(4):
+                requisitar(ip, "/" if i % 2 == 0 else "/api/status", t0 + timedelta(minutes=3 * i))
+
+        # IP hostil: 60 requisições em 10 s, 40 delas para 8 rotas inexistentes.
+        inexistentes = ["/admin", "/login.php", "/.env", "/wp-admin", "/backup.zip",
+                        "/phpmyadmin", "/config.json", "/api/v2/users"]
+        inicio_ataque = t0 + timedelta(minutes=10)
+        for i in range(60):
+            rota = inexistentes[i % 8] if i % 3 != 0 else "/api/status"  # 40 inexistentes, 20 válidas
+            requisitar("185.220.101.1", rota, inicio_ataque + timedelta(seconds=10 * i / 59))
+
+        agora[0] = inicio_ataque + timedelta(seconds=11)
+        analisar_acessos(imprimir=True)
+
+        r = requisitar("185.220.101.1", "/api/status", agora[0])
+        print(f"Próxima requisição de 185.220.101.1 -> {r.status_code} {r.get_json()}")
+        print(f"                                       Retry-After: {r.headers.get('Retry-After')}")
+        r = requisitar("192.168.1.10", "/api/status", agora[0])
+        print(f"Próxima requisição de 192.168.1.10  -> {r.status_code}")
+    finally:
+        relogio = relogio_real
+
+
+def analise_periodica():
+    while True:
+        time.sleep(30)
+        try:
+            analisar_acessos()
+        except Exception:
+            app.logger.exception("falha na análise de acessos")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "teste":
+        rodar_testes()
+    else:
+        threading.Thread(target=analise_periodica, daemon=True).start()
+        app.run(debug=False, host="127.0.0.1")

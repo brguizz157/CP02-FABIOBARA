@@ -1,0 +1,176 @@
+"""Exercício 6 — Controle de acesso quebrado (A01).
+
+Dependências: pip install flask mysql-connector-python
+Uso:
+    python ex6_incidentes_api.py          # sobe a API em http://127.0.0.1:5000
+    python ex6_incidentes_api.py teste    # roda a matriz de testes (sem precisar do servidor no ar)
+Cada execução recria as tabelas e os dados de exemplo.
+"""
+import os
+import sys
+from functools import wraps
+
+import mysql.connector
+from flask import Flask, g, jsonify, request
+
+app = Flask(__name__)
+
+NIVEL_PARA_APAGAR = 5
+
+analistas = [(1, "ana", "key-ana-001", 5), (2, "bruno", "key-bruno-002", 2)]
+incidentes = [(1, 1, "Brute force SSH", "critica"), (2, 2, "Phishing no RH", "media")]
+
+
+def db():
+    return mysql.connector.connect(
+        host=os.getenv("MYSQL_HOST", "localhost"),
+        user=os.getenv("MYSQL_USER", "root"),
+        password=os.getenv("MYSQL_PASSWORD", "senha"),
+        database=os.getenv("MYSQL_DB", "seguranca"),
+    )
+
+
+def consultar(sql, params=(), um=False):
+    con = db()
+    try:
+        cur = con.cursor(dictionary=True)
+        cur.execute(sql, params)
+        return cur.fetchone() if um else cur.fetchall()
+    finally:
+        con.close()
+
+
+# ---------- Autenticação: "quem é você?" -> 401 ----------
+def exigir_login(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        chave = request.headers.get("X-API-Key")
+        analista = None
+        if chave:
+            analista = consultar(
+                "SELECT id, nome, nivel FROM analistas WHERE api_key = %s", (chave,), um=True
+            )
+        if analista is None:
+            # Mesma resposta para "sem header" e "chave inexistente".
+            return jsonify({"erro": "não autenticado"}), 401
+        g.analista = analista
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def buscar_incidente(incidente_id):
+    return consultar(
+        "SELECT id, dono_id, titulo, severidade, status FROM incidentes WHERE id = %s",
+        (incidente_id,), um=True,
+    )
+
+
+def negado():
+    # Corpo genérico e único: não diz se o incidente existe nem de quem ele é.
+    return jsonify({"erro": "acesso negado"}), 403
+
+
+# ---------- Autorização: "você pode?" -> 403 ----------
+@app.route("/api/incidentes")
+@exigir_login
+def listar():
+    # O filtro por dono vem do servidor (chave autenticada), nunca de parâmetro do cliente.
+    linhas = consultar(
+        "SELECT id, titulo, severidade, status FROM incidentes WHERE dono_id = %s",
+        (g.analista["id"],),
+    )
+    return jsonify(linhas), 200
+
+
+@app.route("/api/incidentes/<int:incidente_id>")
+@exigir_login
+def ver(incidente_id):
+    inc = buscar_incidente(incidente_id)
+    if inc is None:
+        return jsonify({"erro": "incidente não encontrado"}), 404
+    if inc["dono_id"] != g.analista["id"]:  # barra o IDOR
+        return negado()
+    return jsonify(inc), 200
+
+
+@app.route("/api/incidentes/<int:incidente_id>", methods=["DELETE"])
+@exigir_login
+def apagar(incidente_id):
+    inc = buscar_incidente(incidente_id)
+    if inc is None:
+        return jsonify({"erro": "incidente não encontrado"}), 404
+    if g.analista["nivel"] < NIVEL_PARA_APAGAR:
+        return negado()
+    con = db()
+    try:
+        cur = con.cursor()
+        cur.execute("DELETE FROM incidentes WHERE id = %s", (incidente_id,))
+        con.commit()
+    finally:
+        con.close()
+    return jsonify({"removido": incidente_id}), 200
+
+
+# ---------- Preparação do banco e testes ----------
+def preparar_banco():
+    con = db()
+    cur = con.cursor()
+    cur.execute("DROP TABLE IF EXISTS incidentes")
+    cur.execute("DROP TABLE IF EXISTS analistas")
+    cur.execute("""
+        CREATE TABLE analistas (
+            id INT PRIMARY KEY,
+            nome VARCHAR(50) NOT NULL,
+            api_key VARCHAR(100) NOT NULL UNIQUE,
+            nivel INT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE incidentes (
+            id INT PRIMARY KEY,
+            dono_id INT NOT NULL,
+            titulo VARCHAR(100) NOT NULL,
+            severidade VARCHAR(20) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'aberto',
+            FOREIGN KEY (dono_id) REFERENCES analistas(id)
+        )
+    """)
+    cur.executemany("INSERT INTO analistas (id, nome, api_key, nivel) VALUES (%s,%s,%s,%s)", analistas)
+    cur.executemany("INSERT INTO incidentes (id, dono_id, titulo, severidade) VALUES (%s,%s,%s,%s)", incidentes)
+    con.commit()
+    con.close()
+
+
+def rodar_testes():
+    preparar_banco()
+    cliente = app.test_client()
+    # (método, rota, header, status esperado)
+    matriz = [
+        ("GET", "/api/incidentes/1", "key-ana-001", 200),
+        ("GET", "/api/incidentes/1", "key-bruno-002", 403),
+        ("GET", "/api/incidentes/1", None, 401),
+        ("GET", "/api/incidentes/1", "key-inexistente", 401),
+        ("GET", "/api/incidentes", "key-bruno-002", 200),
+        ("DELETE", "/api/incidentes/2", "key-ana-001", 200),
+        ("DELETE", "/api/incidentes/1", "key-bruno-002", 403),
+        ("GET", "/api/incidentes/999", "key-ana-001", 404),
+    ]
+    acertos = 0
+    for metodo, rota, chave, esperado in matriz:
+        headers = {"X-API-Key": chave} if chave else {}
+        r = cliente.open(rota, method=metodo, headers=headers)
+        ok = r.status_code == esperado
+        # Caso da listagem: além do 200, só pode vir o incidente 2.
+        if rota == "/api/incidentes" and ok:
+            ok = [i["id"] for i in r.get_json()] == [2]
+        acertos += ok
+        print(f"{'OK   ' if ok else 'FALHA'} {metodo:6} {rota:22} {str(chave):16} -> {r.status_code} (esperado {esperado})")
+    print(f"\n{acertos} de {len(matriz)} casos passaram")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "teste":
+        rodar_testes()
+    else:
+        preparar_banco()
+        app.run(debug=False, host="127.0.0.1")

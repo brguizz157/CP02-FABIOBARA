@@ -1,0 +1,98 @@
+"""Exercício 5 — O ORDER BY que o %s não protege.
+
+Dependências: pip install flask mysql-connector-python
+Uso: python ex5_eventos_api.py   (cria a tabela, popula se estiver vazia e sobe em http://127.0.0.1:5000)
+"""
+import os
+import random
+from datetime import datetime, timedelta
+
+import mysql.connector
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+# ✅ Defesa: mapa fechado de valores permitidos (chave da API -> identificador SQL)
+COLUNAS = {"data": "criado_em", "sev": "severidade", "ip": "ip_origem"}
+ORDEM = {"asc": "ASC", "desc": "DESC"}
+
+TAMANHO_PADRAO = 20
+TAMANHO_MAXIMO = 100  # teto do servidor
+
+
+def db():
+    return mysql.connector.connect(
+        host=os.getenv("MYSQL_HOST", "localhost"),
+        user=os.getenv("MYSQL_USER", "root"),
+        password=os.getenv("MYSQL_PASSWORD", "senha"),
+        database=os.getenv("MYSQL_DB", "seguranca"),
+    )
+
+
+@app.route("/api/eventos")
+def listar_eventos():
+    ordenar_por = request.args.get("ordenar_por", "data")
+    ordem = request.args.get("ordem", "desc")
+    tamanho = request.args.get("tamanho", str(TAMANHO_PADRAO))
+
+    # Identificadores: só entram na query se estiverem no mapa fechado.
+    coluna = COLUNAS.get(ordenar_por)
+    if coluna is None:
+        return jsonify({"erro": "campo de ordenação inválido"}), 400
+    sentido = ORDEM.get(ordem.lower())
+    if sentido is None:
+        return jsonify({"erro": "ordem inválida"}), 400
+
+    # Dado: convertido para int e limitado pelo servidor.
+    try:
+        tamanho = int(tamanho)
+    except ValueError:
+        return jsonify({"erro": "tamanho deve ser inteiro"}), 400
+    if tamanho < 1:
+        return jsonify({"erro": "tamanho deve ser maior que zero"}), 400
+    tamanho = min(tamanho, TAMANHO_MAXIMO)
+
+    con = db()
+    try:
+        cur = con.cursor(dictionary=True)
+        # coluna e sentido vêm da whitelist; o valor do LIMIT vai como parâmetro.
+        cur.execute(f"SELECT * FROM eventos ORDER BY {coluna} {sentido} LIMIT %s", (tamanho,))
+        return jsonify(cur.fetchall()), 200
+    finally:
+        con.close()
+
+
+# Comentário:
+# LIMIT %s funciona porque o limite é um dado (um valor), e o placeholder entrega valores ao servidor.
+# ORDER BY %s não funciona porque a coluna é um identificador, parte da estrutura da query: o %s viraria
+# um literal 'sev' (ordena por uma constante) e concatenar no lugar abriria injeção. Dado vai em placeholder; identificador, em whitelist.
+
+
+def preparar_banco():
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS eventos (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            criado_em DATETIME NOT NULL,
+            severidade ENUM('baixa','media','alta','critica') NOT NULL,
+            ip_origem VARCHAR(15) NOT NULL
+        )
+    """)
+    cur.execute("SELECT COUNT(*) FROM eventos")
+    if cur.fetchone()[0] == 0:
+        agora = datetime.now()
+        linhas = [
+            (agora - timedelta(minutes=random.randint(0, 1440)),
+             random.choice(["baixa", "media", "alta", "critica"]),
+             f"192.168.1.{random.randint(2, 254)}")
+            for _ in range(150)
+        ]
+        cur.executemany("INSERT INTO eventos (criado_em, severidade, ip_origem) VALUES (%s,%s,%s)", linhas)
+    con.commit()
+    con.close()
+
+
+if __name__ == "__main__":
+    preparar_banco()
+    app.run(debug=False, host="127.0.0.1")

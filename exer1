@@ -1,0 +1,72 @@
+"""Exercício 1 — Assistente de decisão de armazenamento (Aulas 1 e 8)."""
+
+# Erro inaceitável e risco OWASP (Top 10 2021), por (banco, cap, dado_sensivel).
+CENARIOS = {
+    ("MySQL", "CP", True): (
+        "autenticar ou autorizar com estado desatualizado (senha revogada "
+        "ainda aceita) é pior que ficar fora do ar",
+        "A07 - Falhas de Identificação e Autenticação",
+    ),
+    ("MySQL", "CP", False): (
+        "vender a mesma licença duas vezes ou cobrar sem reservar é pior "
+        "que recusar a compra por instantes",
+        "A04 - Design Inseguro (falha de lógica de negócio / condição de corrida)",
+    ),
+    ("MongoDB", "CP", True): (
+        "uma trilha de auditoria divergente entre nós não vale como prova; "
+        "é melhor recusar a gravação do que gravar versões diferentes",
+        "A08 - Falhas de Integridade de Software e Dados",
+    ),
+    ("MongoDB", "CP", False): (
+        "réplicas mostrando valores diferentes para o mesmo dado quebram "
+        "decisões que dependem dele; é melhor parar do que divergir",
+        "A04 - Design Inseguro",
+    ),
+    ("MongoDB", "AP", False): (
+        "perder 1s de log é aceitável; parar de aceitar log é o erro "
+        "inaceitável, pois deixa o ambiente cego",
+        "A09 - Falhas de Registro e Monitoramento",
+    ),
+    ("MongoDB", "AP", True): (
+        "derrubar todas as sessões por indisponibilidade é o erro "
+        "inaceitável; ler uma sessão levemente atrasada é tolerável, "
+        "desde que o TTL seja curto",
+        "A07 - Falhas de Identificação e Autenticação (sessão revogada ainda válida)",
+    ),
+}
+
+BANCO = {True: "MySQL", False: "MongoDB"}          # chave: precisa_acid
+CAP = {True: "CP", False: "AP"}                    # chave: exige consistência
+MOTIVO_BANCO = {
+    "MySQL": "transações ACID e constraints do MySQL",
+    "MongoDB": "flexibilidade e distribuição do MongoDB, sem exigir ACID entre entidades",
+}
+ESQUEMA = {True: "esquema fixo", False: "esquema variável"}
+ESCALA = {True: "escala horizontal", False: "escala vertical"}
+
+
+def recomendar(perfil: dict) -> dict:
+    banco = BANCO[perfil["precisa_acid"]]
+    exige_consistencia = perfil["precisa_acid"] or not perfil["tolera_atraso_de_consistencia"]
+    cap = CAP[exige_consistencia]
+
+    erro, risco = CENARIOS[(banco, cap, perfil["dado_sensivel"])]
+    justificativa = (
+        f"{erro}. Banco: {MOTIVO_BANCO[banco]} "
+        f"({ESQUEMA[perfil['schema_fixo']]}, {ESCALA[perfil['escala_horizontal']]})."
+    )
+    return {"banco": banco, "cap": cap, "justificativa": justificativa, "risco_owasp": risco}
+
+
+perfis = {
+    "credenciais_do_SOC":      {"schema_fixo": True,  "precisa_acid": True,  "escala_horizontal": False, "tolera_atraso_de_consistencia": False, "dado_sensivel": True},
+    "telemetria_de_sensores":  {"schema_fixo": False, "precisa_acid": False, "escala_horizontal": True,  "tolera_atraso_de_consistencia": True,  "dado_sensivel": False},
+    "trilha_de_auditoria":     {"schema_fixo": False, "precisa_acid": False, "escala_horizontal": True,  "tolera_atraso_de_consistencia": False, "dado_sensivel": True},
+    "carrinho_de_licencas":    {"schema_fixo": True,  "precisa_acid": True,  "escala_horizontal": False, "tolera_atraso_de_consistencia": False, "dado_sensivel": False},
+    "cache_de_sessoes":        {"schema_fixo": True,  "precisa_acid": False, "escala_horizontal": True,  "tolera_atraso_de_consistencia": True,  "dado_sensivel": True},
+}
+
+if __name__ == "__main__":
+    for nome, perfil in perfis.items():
+        r = recomendar(perfil)
+        print(f"{nome}\n  {r['banco']} | {r['cap']} | {r['risco_owasp']}\n  {r['justificativa']}\n")

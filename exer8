@@ -1,0 +1,130 @@
+"""Exercício 8 — Modelo de ML servido por API, com métricas auditáveis.
+
+Dependências: pip install flask pymongo scikit-learn numpy
+Uso:
+    python ex8_triagem_api.py          # sobe a API em http://127.0.0.1:5000
+    python ex8_triagem_api.py teste    # roda a sequência de testes (sem precisar do servidor no ar)
+"""
+import math
+import os
+import sys
+from datetime import datetime, timezone
+
+import numpy as np
+from flask import Flask, jsonify, request
+from pymongo import MongoClient
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+app = Flask(__name__)
+
+mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+previsoes = mongo[os.getenv("MONGO_DB", "seguranca")]["previsoes"]
+
+N_FEATURES = 4  # [falhas_login, portas_distintas, bytes_saida, hora_do_dia]
+
+
+# ---------- Treino (dados sintéticos, reprodutíveis) ----------
+def gerar_dados(n=2000, seed=42):
+    rng = np.random.default_rng(seed)
+    y = (rng.random(n) < 0.10).astype(int)  # ~10% de casos de risco alto: ameaça real é rara
+    alto = y == 1
+    falhas = np.where(alto, rng.poisson(9, n), rng.poisson(1.5, n))
+    portas = np.where(alto, rng.poisson(5, n), rng.poisson(1.5, n))
+    bytes_saida = np.where(alto, rng.lognormal(10.5, 1.0, n), rng.lognormal(7.5, 1.2, n))
+    hora = np.where(alto, rng.integers(0, 8, n), rng.integers(6, 21, n))
+    X = np.column_stack([falhas, portas, bytes_saida, hora]).astype(float)
+    return X, y
+
+
+X, y = gerar_dados()
+X_treino, X_teste, y_treino, y_teste = train_test_split(X, y, test_size=0.25, stratify=y, random_state=42)
+modelo = make_pipeline(StandardScaler(), LogisticRegression(class_weight="balanced", max_iter=1000))
+modelo.fit(X_treino, y_treino)
+
+# Métricas do conjunto de teste, calculadas uma vez. A classe positiva é "alto".
+y_previsto = modelo.predict(X_teste)
+METRICAS = {
+    "precisao": round(float(precision_score(y_teste, y_previsto)), 2),
+    "recall": round(float(recall_score(y_teste, y_previsto)), 2),
+    "f1": round(float(f1_score(y_teste, y_previsto)), 2),
+    "matriz": confusion_matrix(y_teste, y_previsto, labels=[0, 1]).tolist(),  # [[VN, FP], [FN, VP]]
+    "aviso": (
+        "A acurácia foi omitida de propósito: como só cerca de 10% dos casos são de risco alto, "
+        "um modelo que respondesse sempre 'baixo' já teria acurácia alta sem detectar nenhuma ameaça."
+    ),
+}
+
+
+# ---------- Validação: entrada de modelo também é entrada de usuário ----------
+def validar_features(corpo):
+    """Devolve (features, None) se válido ou (None, mensagem_de_erro)."""
+    if not isinstance(corpo, dict) or "features" not in corpo:
+        return None, "corpo JSON com o campo 'features' é obrigatório"
+    features = corpo["features"]
+    if not isinstance(features, list):
+        return None, "features deve ser uma lista"
+    if len(features) != N_FEATURES:
+        return None, f"esperadas {N_FEATURES} features, recebidas {len(features)}"
+    for v in features:
+        # bool é subclasse de int em Python: True/False não são números aqui.
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            return None, "features devem ser numéricas"
+    falhas, portas, bytes_saida, hora = features
+    if min(features) < 0 or hora > 23:
+        return None, "features fora do intervalo válido"
+    return [float(v) for v in features], None
+
+
+@app.route("/api/triagem", methods=["POST"])
+def triagem():
+    features, erro = validar_features(request.get_json(silent=True))
+    if erro:
+        return jsonify({"erro": erro}), 400
+
+    proba = modelo.predict_proba([features])[0]  # colunas: [baixo, alto]
+    risco = "alto" if proba[1] >= 0.5 else "baixo"
+    confianca = round(float(max(proba)), 2)
+
+    # Só previsões válidas chegam aqui, e todas são gravadas para auditoria posterior.
+    previsoes.insert_one({
+        "entrada": features,
+        "saida": risco,
+        "confianca": confianca,
+        "timestamp": datetime.now(timezone.utc),
+    })
+    return jsonify({"risco": risco, "confianca": confianca}), 200
+
+
+@app.route("/api/modelo/metricas")
+def metricas():
+    return jsonify(METRICAS), 200
+
+
+def rodar_testes():
+    previsoes.delete_many({})
+    cliente = app.test_client()
+    casos = [
+        ("POST", {"features": [12, 7, 90000, 3]}),
+        ("POST", {"features": [0, 1, 1200, 14]}),
+        ("POST", {"features": [12, 7, 90000]}),
+        ("POST", {"features": ["12", "sete", 0, 3]}),
+        ("POST", None),  # sem corpo
+    ]
+    for metodo, corpo in casos:
+        r = cliente.open("/api/triagem", method=metodo, json=corpo) if corpo is not None \
+            else cliente.open("/api/triagem", method=metodo)
+        print(f"POST {str(corpo):32} -> {r.status_code} {r.get_json()}")
+    r = cliente.get("/api/modelo/metricas")
+    print(f"GET  /api/modelo/metricas{'':8} -> {r.status_code} {r.get_json()}")
+    print(f"db.previsoes.count_documents({{}}) -> {previsoes.count_documents({})}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "teste":
+        rodar_testes()
+    else:
+        app.run(debug=False, host="127.0.0.1")

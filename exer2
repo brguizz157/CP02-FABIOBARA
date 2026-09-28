@@ -1,0 +1,110 @@
+"""Exercício 2 — Migração relacional -> documentos (MySQL -> MongoDB).
+
+Dependências: pip install mysql-connector-python pymongo
+"""
+import os
+
+import mysql.connector
+from pymongo import MongoClient
+
+ativos = [
+    (1, "SRV-WEB01", "192.168.1.10", "alta"),
+    (2, "PC-RH03", "192.168.1.45", "baixa"),
+]
+alertas = [
+    (1, 1, "BRUTE_FORCE", "critica"),
+    (2, 1, "PORT_SCAN", "alta"),
+    (3, 2, "XSS", "media"),
+]
+
+# ---------- 1. MySQL: criar e popular ----------
+con = mysql.connector.connect(
+    host=os.getenv("MYSQL_HOST", "localhost"),
+    user=os.getenv("MYSQL_USER", "root"),
+    password=os.getenv("MYSQL_PASSWORD", "senha"),
+    database=os.getenv("MYSQL_DB", "seguranca"),
+)
+cur = con.cursor(dictionary=True)
+
+cur.execute("DROP TABLE IF EXISTS alertas")
+cur.execute("DROP TABLE IF EXISTS ativos")
+cur.execute("""
+    CREATE TABLE ativos (
+        id INT PRIMARY KEY,
+        nome VARCHAR(50) NOT NULL,
+        ip VARCHAR(15) NOT NULL UNIQUE,
+        criticidade ENUM('baixa','media','alta') NOT NULL
+    )
+""")
+cur.execute("""
+    CREATE TABLE alertas (
+        id INT PRIMARY KEY,
+        ativo_id INT NOT NULL,
+        tipo VARCHAR(30) NOT NULL,
+        severidade VARCHAR(20) NOT NULL,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (ativo_id) REFERENCES ativos(id)
+    )
+""")
+cur.executemany("INSERT INTO ativos (id, nome, ip, criticidade) VALUES (%s,%s,%s,%s)", ativos)
+cur.executemany("INSERT INTO alertas (id, ativo_id, tipo, severidade) VALUES (%s,%s,%s,%s)", alertas)
+con.commit()
+
+# ---------- 2. Ler com JOIN parametrizado ----------
+# O %s no WHERE permite migrar em lotes (ex.: só ids acima do último migrado).
+cur.execute(
+    """
+    SELECT al.id, al.tipo, al.severidade, al.criado_em,
+           a.nome, a.ip, a.criticidade
+    FROM alertas al
+    JOIN ativos a ON a.id = al.ativo_id
+    WHERE al.id > %s
+    ORDER BY al.id
+    """,
+    (0,),
+)
+linhas = cur.fetchall()
+
+# ---------- 3. Montar documentos (ativo aninhado) e inserir ----------
+docs = [
+    {
+        "_id": l["id"],  # mantém o id do MySQL: migração rastreável e repetível
+        "tipo": l["tipo"],
+        "severidade": l["severidade"],
+        "criado_em": l["criado_em"],
+        "ativo": {"nome": l["nome"], "ip": l["ip"], "criticidade": l["criticidade"]},
+    }
+    for l in linhas
+]
+
+mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+col = mongo[os.getenv("MONGO_DB", "seguranca")]["alertas"]
+col.delete_many({})  # permite rodar o script mais de uma vez
+col.insert_many(docs)
+
+# ---------- 4. Verificar a migração ----------
+cur.execute("SELECT COUNT(*) AS n FROM alertas")
+n_mysql = cur.fetchone()["n"]
+n_mongo = col.count_documents({})
+
+# Contagem igual não basta: compara também o conteúdo de cada alerta.
+origem = {l["id"]: (l["tipo"], l["severidade"], l["nome"], l["ip"], l["criticidade"]) for l in linhas}
+destino = {
+    d["_id"]: (d["tipo"], d["severidade"], d["ativo"]["nome"], d["ativo"]["ip"], d["ativo"]["criticidade"])
+    for d in col.find()
+}
+integra = n_mysql == n_mongo and origem == destino
+
+print(f"MySQL: {n_mysql} alertas | MongoDB: {n_mongo} documentos -> "
+      f"{'MIGRAÇÃO ÍNTEGRA' if integra else 'MIGRAÇÃO COM DIVERGÊNCIA'}")
+
+n_alta = col.count_documents({"ativo.criticidade": "alta"})
+print(f'Consulta sem JOIN: db.alertas.find({{"ativo.criticidade":"alta"}}) -> {n_alta} documentos')
+
+# Comentário:
+# Ganha-se leitura sem JOIN: o alerta já traz os dados do ativo, numa única consulta.
+# Perde-se com a duplicação: renomear um ativo exige update_many em todos os seus alertas.
+
+cur.close()
+con.close()
+mongo.close()

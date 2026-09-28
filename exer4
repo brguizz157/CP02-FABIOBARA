@@ -1,0 +1,114 @@
+"""Exercício 4 — Transação com trilha de auditoria (MySQL + MongoDB).
+
+Dependências: pip install mysql-connector-python pymongo
+"""
+import os
+from datetime import datetime, timezone
+
+import mysql.connector
+from pymongo import MongoClient
+
+NIVEL_MINIMO_ADMIN = 5
+
+usuarios = [
+    (1, "ana", "ana@x.com", 5),
+    (2, "bruno", "bruno@x.com", 2),
+    (3, "caio", "caio@x.com", 1),
+]
+
+
+def conectar_mysql():
+    return mysql.connector.connect(
+        host=os.getenv("MYSQL_HOST", "localhost"),
+        user=os.getenv("MYSQL_USER", "root"),
+        password=os.getenv("MYSQL_PASSWORD", "senha"),
+        database=os.getenv("MYSQL_DB", "seguranca"),
+    )
+
+
+mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+auditoria = mongo[os.getenv("MONGO_DB", "seguranca")]["auditoria"]
+
+
+def alterar_nivel(admin_id, alvo_id, novo_nivel):
+    con = conectar_mysql()
+    cur = con.cursor(dictionary=True)
+    resultado, motivo = "RECUSADO", ""
+    alvo = None
+    nivel_anterior = None
+
+    try:
+        con.start_transaction()
+
+        cur.execute("SELECT nivel_acesso FROM usuarios WHERE id = %s FOR UPDATE", (admin_id,))
+        admin = cur.fetchone()
+        cur.execute("SELECT nome, nivel_acesso FROM usuarios WHERE id = %s FOR UPDATE", (alvo_id,))
+        alvo = cur.fetchone()
+        nivel_anterior = alvo["nivel_acesso"] if alvo else None
+
+        if admin is None or admin["nivel_acesso"] < NIVEL_MINIMO_ADMIN:
+            motivo = "admin sem privilégio"
+        elif admin_id == alvo_id:
+            motivo = "auto-promoção"
+        elif alvo is None:
+            motivo = "alvo inexistente"
+        else:
+            cur.execute("UPDATE usuarios SET nivel_acesso = %s WHERE id = %s", (novo_nivel, alvo_id))
+            con.commit()
+            resultado = "OK"
+
+    except Exception:
+        resultado = "ERRO"
+        raise
+    finally:
+        if resultado != "OK":
+            con.rollback()
+        # A auditoria roda sempre: aceita, recusada ou com erro.
+        auditoria.insert_one({
+            "quem": admin_id,
+            "alvo": alvo_id,
+            "nivel_anterior": nivel_anterior,
+            "nivel_novo": novo_nivel,
+            "resultado": resultado,
+            "timestamp": datetime.now(timezone.utc),
+        })
+        cur.close()
+        con.close()
+
+    if resultado == "OK":
+        return f"OK. commit. {alvo['nome'].capitalize()}: {nivel_anterior} -> {novo_nivel}"
+    detalhe = f" {alvo['nome'].capitalize()}: {nivel_anterior}" if alvo else ""
+    return f"RECUSADO ({motivo}). rollback.{detalhe}"
+
+
+if __name__ == "__main__":
+    # Prepara o MySQL e zera a auditoria
+    con = conectar_mysql()
+    cur = con.cursor()
+    cur.execute("DROP TABLE IF EXISTS usuarios")
+    cur.execute("""
+        CREATE TABLE usuarios (
+            id INT PRIMARY KEY,
+            nome VARCHAR(50) NOT NULL,
+            email VARCHAR(100) NOT NULL UNIQUE,
+            nivel_acesso INT NOT NULL
+        )
+    """)
+    cur.executemany("INSERT INTO usuarios (id, nome, email, nivel_acesso) VALUES (%s,%s,%s,%s)", usuarios)
+    con.commit()
+    cur.close()
+    con.close()
+    auditoria.delete_many({})
+
+    # Sequência de teste
+    print("alterar_nivel(1, 2, 4)  ->", alterar_nivel(1, 2, 4))
+    print("alterar_nivel(2, 3, 5)  ->", alterar_nivel(2, 3, 5))
+    print("alterar_nivel(1, 1, 9)  ->", alterar_nivel(1, 1, 9))
+    print("alterar_nivel(1, 99, 3) ->", alterar_nivel(1, 99, 3))
+
+    total = auditoria.count_documents({})
+    ok = auditoria.count_documents({"resultado": "OK"})
+    recusados = auditoria.count_documents({"resultado": "RECUSADO"})
+    print(f"\nTrilha de auditoria ao final: {total} documentos ({ok} sucesso, {recusados} recusas)")
+    print(f'db.auditoria.count_documents({{"resultado":"RECUSADO"}}) -> {recusados}')
+    mongo.close()
